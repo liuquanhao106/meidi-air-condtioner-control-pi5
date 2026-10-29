@@ -4,6 +4,11 @@
 
 自带一个手机尺寸适配的 Web 控制台，以及一个命令行工具。
 
+<p align="center">
+  <img src="docs/ui-top.png" width="330" alt="状态与温度控制">
+  <img src="docs/ui-bottom.png" width="330" alt="常用功能与开关机">
+</p>
+
 ## 功能
 
 **Web 控制台**
@@ -168,3 +173,7 @@ curl -X POST http://127.0.0.1:8765/api/control \
 ## 致谢
 
 协议细节来自 [mill1000/midea-msmart](https://github.com/mill1000/midea-msmart) 与 [georgezhao2010/midea_ac_lan](https://github.com/georgezhao2010/midea_ac_lan)。
+
+## 许可证
+
+[MIT License](./LICENSE) © liuquanhao106
