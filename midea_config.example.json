@@ -1,0 +1,14 @@
+{
+  "ip": "192.168.1.10",
+  "port": 6444,
+  "id": 0,
+  "sn": "",
+  "name": "美的空调",
+  "model": "",
+  "home_id": null,
+  "home_name": null,
+  "version": 3,
+  "token": "在此填入 32 字节 token 的十六进制字符串",
+  "key": "在此填入 32 字节 key 的十六进制字符串",
+  "saved_at": ""
+}
