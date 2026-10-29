@@ -6,3 +6,6 @@ venv/
 # 设备密钥，切勿提交
 midea_config.json
 .env
+
+# 桌面卡片本地状态
+widget_state.json

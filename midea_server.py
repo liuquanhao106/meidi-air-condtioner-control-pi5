@@ -21,11 +21,15 @@ from pathlib import Path
 
 from msmart.device.AC.device import AirConditioner
 from msmart.discover import Discover
+from msmart.lan import AuthenticationError
+
+import midea_config as config
+from midea_config import SetupNeeded
 
 BASE = Path(__file__).parent
-CONFIG = BASE / "midea_config.json"
 HTML = BASE / "midea_ui.html"
 PORT = 8765
+__version__ = "1.1.0"
 
 CONNECT_TIMEOUT = 12.0   # 单次鉴权+刷新上限
 IO_TIMEOUT = 8.0         # 单条指令/刷新上限
@@ -39,19 +43,6 @@ ANGLES = {"off": "OFF", "pos1": "POS_1", "pos2": "POS_2", "pos3": "POS_3", "pos4
 FAN_PCT = {"silent": 20, "low": 40, "medium": 60, "high": 80, "max": 100}
 
 
-def load_config() -> dict:
-    return json.loads(CONFIG.read_text(encoding="utf-8"))
-
-
-def save_config_ip(ip: str) -> None:
-    """设备换 IP 后写回配置，token/key 与 IP 无关可继续使用。"""
-    cfg = load_config()
-    if cfg.get("ip") == ip:
-        return
-    cfg["ip"] = ip
-    CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
 async def _auth(ip: str, cfg: dict) -> AirConditioner:
     dev = AirConditioner(ip, cfg["id"], cfg["port"], version=3,
                          sn=cfg["sn"], name=cfg["name"])
@@ -60,8 +51,12 @@ async def _auth(ip: str, cfg: dict) -> AirConditioner:
     return dev
 
 
-async def _discover_ip(device_id: int):
-    """UDP 广播发现，按设备 ID 匹配，返回当前 IP。"""
+async def _discover_ip(cfg: dict):
+    """UDP 广播发现：按设备 ID 或 SN 匹配，返回当前 IP。
+
+    id 取自广播报文的 [20:26] 小端解析值（msmart 内部已完成），这里再做一次 SN 兜底，
+    避免固件把 id 报成 0 时匹配失败；同时打印每台设备的明细，便于排查。
+    """
     try:
         found = await Discover.discover(timeout=DISCOVER_TIMEOUT,
                                         discovery_packets=3,
@@ -71,8 +66,21 @@ async def _discover_ip(device_id: int):
         return None
 
     for dev in found:
-        if getattr(dev, "id", None) == device_id:
+        print(f"  found id={getattr(dev, 'id', None)} sn={getattr(dev, 'sn', '')} "
+              f"ip={getattr(dev, 'ip', '')}", file=sys.stderr)
+
+    want_id, want_sn = cfg.get("id"), cfg.get("sn")
+    for dev in found:
+        if getattr(dev, "id", None) == want_id:
             return getattr(dev, "ip", None)
+        if want_sn and getattr(dev, "sn", "") == want_sn:
+            return getattr(dev, "ip", None)
+
+    # 原 IP 上出现了别的设备：不是换地址，而是身份对不上，交给设置弹窗
+    for dev in found:
+        if getattr(dev, "ip", None) == cfg.get("ip") and getattr(dev, "id", None) != want_id:
+            raise SetupNeeded("device_mismatch",
+                              f"{cfg.get('ip')} 上是 id={getattr(dev, 'id', None)} 的另一台设备")
     return None
 
 
@@ -110,8 +118,10 @@ class DeviceManager:
                         del self._inflight[key]
 
     def reset(self):
-        self._dev = None
-        self._cache = None
+        with self._lock:
+            self._dev = None
+            self._cache = None
+            self._cache_ts = 0.0
 
     def cached_status(self):
         if self._cache and time.monotonic() - self._cache_ts < STATUS_CACHE:
@@ -131,8 +141,8 @@ class DeviceManager:
                     if self._dev is None:
                         self._dev = await self._connect()
                     return await action(self._dev)
-                except ValueError:
-                    raise                  # 业务参数错误，不重连
+                except (SetupNeeded, ValueError):
+                    raise                  # 配置/参数错误：不重连、不吞异常
                 except Exception:
                     self._dev = None       # 连接异常：丢弃并重连一次
                     self._cache = None
@@ -140,21 +150,91 @@ class DeviceManager:
                         raise
 
     async def _connect(self) -> AirConditioner:
-        cfg = load_config()
+        cfg = config.load()                      # 配置不完整时抛 SetupNeeded
         try:
             return await asyncio.wait_for(_auth(cfg["ip"], cfg), CONNECT_TIMEOUT)
+        except AuthenticationError as e:         # 密钥被设备拒绝：交给设置弹窗
+            print(f"authenticate {cfg['ip']} failed: {e}", file=sys.stderr)
+            raise SetupNeeded("auth_failed") from e
         except Exception as e:
             # 可能是 DHCP 换了地址：广播重新定位后重试
             print(f"connect {cfg['ip']} failed ({e}), try discovery", file=sys.stderr)
-            ip = await _discover_ip(cfg["id"])
+            ip = await _discover_ip(cfg)
             if not ip:
                 raise
             print(f"discovered device {cfg['id']} at {ip}", file=sys.stderr)
-            save_config_ip(ip)
-            return await asyncio.wait_for(_auth(ip, cfg), CONNECT_TIMEOUT)
+            config.update_ip(ip)
+            try:
+                return await asyncio.wait_for(_auth(ip, cfg), CONNECT_TIMEOUT)
+            except AuthenticationError as e2:
+                print(f"authenticate {ip} failed: {e2}", file=sys.stderr)
+                raise SetupNeeded("auth_failed") from e2
 
 
 MANAGER = DeviceManager()
+
+
+async def _discover_all() -> list[dict]:
+    found = await Discover.discover(timeout=DISCOVER_TIMEOUT, discovery_packets=3,
+                                    auto_connect=False)
+    out = []
+    for dev in found:
+        out.append({
+            "ip": getattr(dev, "ip", ""),
+            "port": getattr(dev, "port", 6444),
+            "id": int(getattr(dev, "id", 0) or 0),
+            "sn": getattr(dev, "sn", ""),
+            "name": getattr(dev, "name", ""),
+            "model": getattr(dev, "model", ""),
+        })
+    return out
+
+
+def list_devices() -> list[dict]:
+    """设置弹窗用：广播发现局域网内的空调。"""
+    try:
+        return asyncio.run(_discover_all())
+    except SetupNeeded:
+        raise
+    except Exception as e:
+        raise SetupNeeded("unreachable", f"广播发现失败：{e}")
+
+
+async def _verify_credentials(cfg: dict) -> None:
+    dev = AirConditioner(cfg["ip"], cfg["id"], cfg["port"], version=3,
+                         sn=cfg["sn"], name=cfg["name"])
+    await asyncio.wait_for(dev.authenticate(cfg["token"], cfg["key"]), CONNECT_TIMEOUT)
+
+
+def apply_setup(payload: dict) -> dict:
+    """先真实鉴权，成功才落盘；避免把无效密钥写进配置。"""
+    token, key = config.check_credentials(payload.get("token"), payload.get("key"))
+    ip = str(payload.get("ip") or "").strip()
+    try:
+        dev_id = int(payload.get("id"))
+        port = int(payload.get("port") or 6444)
+    except (TypeError, ValueError):
+        raise SetupNeeded("missing", "设备信息不完整，请重新发现设备")
+    if not ip or dev_id <= 0:
+        raise SetupNeeded("missing", "设备信息不完整，请重新发现设备")
+
+    cfg = {
+        "ip": ip, "port": port, "id": dev_id,
+        "sn": payload.get("sn", ""), "name": payload.get("name", ""),
+        "model": payload.get("model", ""), "version": 3,
+        "token": token, "key": key,
+    }
+    try:
+        asyncio.run(_verify_credentials(cfg))
+    except AuthenticationError as e:
+        print(f"setup authenticate {ip} failed: {e}", file=sys.stderr)
+        raise SetupNeeded("auth_failed")
+    except Exception as e:
+        raise SetupNeeded("unreachable", f"连不上 {ip}：{e}")
+
+    config.write(cfg)
+    MANAGER.reset()
+    return get_status()
 
 
 def _has(dev, name: str) -> bool:
@@ -217,9 +297,16 @@ def state_of(dev: AirConditioner) -> dict:
         if getattr(dev, "vertical_swing_angle", None) is not None else None,
         "caps": capabilities(dev),
         "error": dev.error_code,
-        "model": load_config().get("model") or "",
+        "model": _cfg_model(),
         "ip": dev.ip,
     }
+
+
+def _cfg_model() -> str:
+    try:
+        return config.read().get("model") or ""
+    except SetupNeeded:
+        return ""
 
 
 async def _read_state(dev: AirConditioner) -> dict:
@@ -234,6 +321,37 @@ def get_status() -> dict:
     state = MANAGER.run("status", _read_state)
     MANAGER.store_status(state)
     return state
+
+
+# 指令字段 → 状态字段，用于下发后回读校验
+WANT_KEYS = {
+    "power": "power", "temp": "target", "mode": "mode", "fan": "fan",
+    "fan_pct": "fan_pct", "swing_v": "swing_v", "swing_h": "swing_h",
+    "breeze": "breeze", "eco": "eco", "turbo": "turbo", "freeze": "freeze",
+    "purifier": "purifier", "sound": "sound", "display": "display",
+    "ieco": "ieco", "aux": "aux", "angle_v": "angle_v",
+}
+
+
+def mismatches(payload: dict, s: dict) -> dict:
+    """把请求字段与回读状态逐项比对，返回未生效的字段。"""
+    bad = {}
+    for k, sk in WANT_KEYS.items():
+        if k not in payload:
+            continue
+        want, got = payload[k], s.get(sk)
+        if k == "temp":
+            if got is None or abs(float(got) - float(want)) > 0.5:
+                bad[k] = (want, got)
+        elif k == "fan_pct":
+            if got is None or abs(int(got) - int(want)) > 6:
+                bad[k] = (want, got)
+        elif k == "angle_v":
+            if str(got).lower() != str(want).lower():
+                bad[k] = (want, got)
+        elif bool(got) != bool(want):
+            bad[k] = (want, got)
+    return bad
 
 
 def apply_control(payload: dict) -> dict:
@@ -309,12 +427,35 @@ def apply_control(payload: dict) -> dict:
         await asyncio.wait_for(dev.apply(), IO_TIMEOUT)
         await asyncio.sleep(1.2)
         await asyncio.wait_for(dev.refresh(), IO_TIMEOUT)
-        return state_of(dev)
+        state = state_of(dev)
+        bad = mismatches(payload, state)      # 回读校验：设备没接受就明确告诉前端
+        state["applied"] = not bad
+        if bad:
+            state["mismatch"] = {k: {"want": w, "got": g} for k, (w, g) in bad.items()}
+        return state
 
     key = "control:" + json.dumps(payload, sort_keys=True, ensure_ascii=False)
     state = MANAGER.run(key, action)
-    MANAGER.store_status(state)   # 指令后的状态直接进缓存，避免紧接着重复读设备
+    clean = {k: v for k, v in state.items() if k not in ("applied", "mismatch")}
+    MANAGER.store_status(clean)   # 指令后的状态直接进缓存，避免紧接着重复读设备
     return state
+
+
+def _safe_cfg() -> dict:
+    try:
+        return config.read()
+    except SetupNeeded:
+        return {}
+
+
+def setup_body(exc: SetupNeeded) -> dict:
+    """428 响应体：告诉前端为什么需要填密钥，并附上可公开的设备信息。"""
+    return {
+        "error": "need_credentials",
+        "reason": exc.reason,
+        "message": str(exc),
+        "device": config.public_info(_safe_cfg()),
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -336,27 +477,42 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, HTML.read_bytes(), "text/html; charset=utf-8")
         elif path == "/api/status":
             try:
-                self._send(200, get_status())
+                self._send(200, dict(get_status(), version=__version__))
+            except SetupNeeded as e:
+                self._send(428, setup_body(e))
+            except Exception as e:
+                self._send(502, {"error": str(e)})
+        elif path == "/api/setup/discover":
+            try:
+                self._send(200, {"devices": list_devices()})
+            except SetupNeeded as e:
+                self._send(428, setup_body(e))
             except Exception as e:
                 self._send(502, {"error": str(e)})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/api/control":
+        path = self.path.split("?", 1)[0]
+        if path not in ("/api/control", "/api/setup"):
             self._send(404, {"error": "not found"})
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            self._send(200, apply_control(payload))
+            if path == "/api/setup":
+                self._send(200, {"ok": True, "state": apply_setup(payload)})
+            else:
+                self._send(200, apply_control(payload))
+        except SetupNeeded as e:
+            self._send(428, setup_body(e))
         except Exception as e:
             self._send(400, {"error": str(e)})
 
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"美的空调控制台已启动: http://127.0.0.1:{PORT}")
+    print(f"美的空调控制台 v{__version__} 已启动: http://127.0.0.1:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

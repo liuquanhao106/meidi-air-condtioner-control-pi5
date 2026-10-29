@@ -139,6 +139,31 @@
     animation:spin .7s linear infinite}
   .slide.pending{opacity:.55;pointer-events:none}
   @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ---------- 首次连接 / 密钥失效 的设置弹窗 ---------- */
+  .setup-mask{position:fixed;inset:0;background:rgba(24,28,36,.45);display:none;
+    align-items:center;justify-content:center;z-index:20;padding:16px}
+  .setup-mask.show{display:flex}
+  .setup-card{width:100%;max-width:380px;background:#fff;border-radius:16px;padding:20px;
+    box-shadow:0 12px 40px rgba(0,0,0,.18);max-height:92vh;overflow:auto}
+  .setup-card h2{margin:0 0 6px;font-size:17px}
+  .setup-msg{margin:0 0 12px;font-size:12.5px;color:#7a8290;line-height:1.5}
+  .setup-dev{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+  .sdev{border:1px solid #e6e9ee;border-radius:10px;padding:9px 11px;cursor:pointer;font-size:13px}
+  .sdev b{display:block;font-weight:600}
+  .sdev small{color:#8a92a0;font-size:11.5px}
+  .sdev.active{border-color:var(--accent);background:rgba(47,127,224,.06)}
+  .sdev.empty{border-style:dashed;color:#8a92a0;text-align:center;cursor:default}
+  .setup-card label{display:block;font-size:12px;color:#5c6472;margin-bottom:10px}
+  .setup-card input[type=password],.setup-card input[type=text]{width:100%;margin-top:4px;padding:9px 10px;
+    border:1px solid #e0e4ea;border-radius:9px;font:12.5px/1.4 ui-monospace,monospace;box-sizing:border-box}
+  .setup-card input.bad{border-color:#e05a5a;background:#fff7f7}
+  .setup-actions{display:flex;gap:8px;margin-top:4px}
+  .setup-actions button{flex:1;padding:10px;border-radius:10px;border:1px solid #e0e4ea;background:#fff;
+    font-size:13px;cursor:pointer}
+  .setup-actions button#sSave{background:var(--accent);border-color:var(--accent);color:#fff}
+  .setup-actions button:disabled{opacity:.6;cursor:default}
+  .setup-err{margin-top:9px;font-size:12px;color:#d04545;min-height:16px;line-height:1.5}
 </style>
 </head>
 <body>
@@ -236,6 +261,23 @@
 <div class="sheet" id="sheet"><h3 id="sheetTitle">选择</h3><div class="opts" id="opts"></div></div>
 <div class="toast" id="toast"></div>
 
+<div class="setup-mask" id="setupMask">
+  <div class="setup-card">
+    <h2 id="setupTitle">首次连接</h2>
+    <p class="setup-msg" id="setupMsg"></p>
+    <div class="setup-dev" id="setupDev"></div>
+    <label>token（128 位十六进制）
+      <input id="sToken" type="password" autocomplete="off" spellcheck="false" placeholder="从美居 App 获取的 token"></label>
+    <label>key（64 位十六进制）
+      <input id="sKey" type="password" autocomplete="off" spellcheck="false" placeholder="从美居 App 获取的 key"></label>
+    <div class="setup-actions">
+      <button id="sDiscover">重新发现</button>
+      <button id="sSave">保存并连接</button>
+    </div>
+    <div class="setup-err" id="sErr"></div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let state = null, busy = false;
@@ -264,14 +306,98 @@ async function act(payload, el){
   if(busy) return toast('上一条指令还在执行，请稍候');
   busy = true;
   el?.classList.add('pending');
-  try{ render(await api('/api/control', payload)); }
+  try{
+    const s = await api('/api/control', payload);
+    render(s);
+    if(s.applied === false){          // 设备没接受，界面上以回读值为准并提示
+      toast('指令未生效：' + Object.keys(s.mismatch || {}).join('、'));
+    }
+  }
   catch(e){ toast('指令失败：' + e.message); }
   finally{ busy = false; el?.classList.remove('pending'); }
 }
 
 async function load(){
-  try{ render(await api('/api/status')); }
-  catch(e){ toast('读取失败：' + e.message); }
+  try{
+    render(await api('/api/status'));
+    $('setupMask').classList.remove('show');
+  }catch(e){
+    if(e.status === 428){ return showSetup(e.data); }   // 需要 token/key
+    toast('读取失败：' + e.message);
+  }
+}
+
+/* ---------- 设置弹窗：首次连接或密钥失效时填 token/key ---------- */
+let setupSel = null;
+
+function setupErr(msg){
+  $('sErr').textContent = msg || '';
+}
+
+function showSetup(d){
+  d = d || {};
+  $('setupTitle').textContent = d.reason === 'auth_failed' ? '密钥已失效' : '首次连接';
+  $('setupMsg').textContent = d.message || '';
+  setupErr('');
+  setupSel = null;
+  $('sToken').classList.remove('bad');
+  $('sKey').classList.remove('bad');
+  $('setupMask').classList.add('show');
+  discoverDevices(d.device);
+}
+
+async function discoverDevices(fallback){
+  $('setupDev').innerHTML = '<div class="sdev empty">正在发现局域网内的空调…</div>';
+  let list = [];
+  try{
+    list = (await api('/api/setup/discover')).devices || [];
+  }catch(e){
+    list = [];
+    setupErr('发现失败：' + e.message);
+  }
+  if(!list.length && fallback && fallback.ip) list = [fallback];
+  if(!list.length){
+    $('setupDev').innerHTML = '<div class="sdev empty">未发现设备，请确认空调已通电并接入同一 Wi-Fi</div>';
+    setupSel = null;
+    return;
+  }
+  $('setupDev').innerHTML = list.map((d, i) =>
+    `<div class="sdev" data-i="${i}"><b>${d.name || '空调'}</b><small>${
+      [d.model, d.ip, d.sn && ('SN ' + d.sn)].filter(Boolean).join(' · ')
+    }</small></div>`).join('');
+  const els = [...$('setupDev').querySelectorAll('.sdev')];
+  els.forEach((el, i) => el.onclick = () => {
+    els.forEach(x => x.classList.remove('active'));
+    el.classList.add('active');
+    setupSel = list[i];
+  });
+  els[0].click();
+}
+
+async function saveSetup(){
+  const token = $('sToken').value.trim();
+  const key = $('sKey').value.trim();
+  const okT = /^[0-9a-fA-F]{128}$/.test(token);
+  const okK = /^[0-9a-fA-F]{64}$/.test(key);
+  $('sToken').classList.toggle('bad', !okT);
+  $('sKey').classList.toggle('bad', !okK);
+  if(!setupSel) return setupErr('请先选择要连接的空调');
+  if(!okT) return setupErr(`token 应为 128 位十六进制，当前 ${token.length} 位`);
+  if(!okK) return setupErr(`key 应为 64 位十六进制，当前 ${key.length} 位`);
+
+  const btn = $('sSave');
+  btn.disabled = true; btn.textContent = '连接中…';
+  setupErr('');
+  try{
+    const r = await api('/api/setup', Object.assign({}, setupSel, {token, key}));
+    $('setupMask').classList.remove('show');
+    render(r.state);
+    toast('连接成功');
+  }catch(e){
+    setupErr(e.message);
+  }finally{
+    btn.disabled = false; btn.textContent = '保存并连接';
+  }
 }
 
 /* 温度滑块的浮动标注：跟随滑块位置显示当前度数 */
@@ -307,8 +433,12 @@ function render(s){
 
 async function api(path, body){
   const r = await fetch(path, body ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)} : {});
-  const data = await r.json();
-  if(!r.ok) throw new Error(data.error || '请求失败');
+  const data = await r.json().catch(() => ({}));
+  if(!r.ok){
+    const err = new Error(data.message || data.error || '请求失败');
+    err.status = r.status; err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -376,6 +506,8 @@ document.querySelectorAll('.fn').forEach(el => {
 });
 
 $('sortBtn').onclick = () => toast('暂时只展示常用功能，排序未实现');
+$('sSave').onclick = saveSetup;
+$('sDiscover').onclick = () => discoverDevices(null);
 $('helpBtn').onclick = () => {
   const opts = Object.entries(HELP).map(([k,v]) => [k, `<b>${k}</b><br><small style="color:#9aa5b5">${v}</small>`]);
   sheet('功能说明', opts, null, () => {});
