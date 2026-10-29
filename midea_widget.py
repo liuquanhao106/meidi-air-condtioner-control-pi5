@@ -29,6 +29,11 @@ BG = "#ffffff"
 FG = "#1f2430"
 SUB = "#8b93a1"
 
+HWND_BOTTOM = 1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+
 MODES = {"cool": "制冷", "heat": "制热", "dry": "除湿", "fan": "送风", "auto": "自动"}
 FANS = {"auto": "自动", "silent": "静音", "low": "低", "medium": "中", "high": "高", "max": "强劲"}
 
@@ -56,19 +61,22 @@ class Card:
         self.busy = False
         self.setup_mode = False
         self._dx = self._dy = 0
+        self._dragging = False
 
         pos = self._load_pos()
         root.geometry(f"320x152+{pos.get('x', 60)}+{pos.get('y', 60)}")
         root.overrideredirect(True)
-        root.attributes("-topmost", bool(pos.get("topmost", True)))
+        root.attributes("-topmost", bool(pos.get("topmost", False)))
         root.attributes("-alpha", 0.97)
         root.configure(bg=BG)
 
-        self.top_var = tk.BooleanVar(value=bool(pos.get("topmost", True)))
+        self.top_var = tk.BooleanVar(value=bool(pos.get("topmost", False)))
         self._build()
         self._bind_drag()
         root.after(120, self._tool_window)
+        root.after(200, self._send_to_bottom)
         root.after(300, self.poll)
+        root.after(1500, self._stay_bottom)
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
     # ---------- 外观 ----------
@@ -135,19 +143,43 @@ class Card:
         except Exception:
             pass
 
+    def _send_to_bottom(self):
+        """压到所有窗口之下，像桌面图标一样常驻；置顶时不处理。"""
+        if self.top_var.get():
+            return
+        try:
+            ctypes.windll.user32.SetWindowPos(
+                ctypes.windll.user32.GetParent(self.root.winfo_id()),
+                HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception:
+            pass
+
+    def _stay_bottom(self):
+        """点击/拖拽会把窗口带到前面，定时再压回底层。"""
+        if not self._dragging:
+            self._send_to_bottom()
+        self.root.after(2000, self._stay_bottom)
+
     def _bind_drag(self):
         for w in (self.root, self.name, self.temp, self.sub):
             w.bind("<Button-1>", self._start_move)
             w.bind("<B1-Motion>", self._do_move)
-            w.bind("<ButtonRelease-1>", lambda e: self._save_pos())
+            w.bind("<ButtonRelease-1>", self._end_move)
 
     def _start_move(self, e):
+        self._dragging = True
         self._dx, self._dy = e.x, e.y
 
     def _do_move(self, e):
         x = self.root.winfo_pointerx() - self._dx
         y = self.root.winfo_pointery() - self._dy
         self.root.geometry(f"+{x}+{y}")
+
+    def _end_move(self, e):
+        self._dragging = False
+        self._save_pos()
+        self._send_to_bottom()
 
     # ---------- 数据 ----------
     def poll(self):
@@ -259,7 +291,10 @@ class Card:
         m.tk_popup(e.x_root, e.y_root)
 
     def toggle_top(self):
-        self.root.attributes("-topmost", self.top_var.get())
+        on = self.top_var.get()
+        self.root.attributes("-topmost", on)
+        if not on:
+            self._send_to_bottom()
         self._save_pos()
 
     def install_startup(self):
