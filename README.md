@@ -85,7 +85,7 @@ python midea_ctl.py swing vertical # off|vertical|horizontal|both
   "fan": "silent", "fan_pct": 20, "swing_v": false, "swing_h": false,
   "eco": false, "turbo": false, "display": true, "filter_alert": false,
   "caps": {"eco": true, "turbo": true, "breeze": false, "angle": false, "custom_fan": true},
-  "error": 0, "model": "KFR-35G/G3-1A", "ip": "192.168.3.99"
+  "error": 0, "model": "KFR-35G/G3-1A", "ip": "192.168.1.10"
 }
 ```
 
